@@ -181,20 +181,27 @@
       const PRESET_VIEWS = {
         buildings: { center: [-73.985, 40.758], zoom: 15.5, pitch: 50 },
         places: { center: [139.7625, 35.681], zoom: 15, pitch: 0 },
+        transportation: { center: [139.7625, 35.681], zoom: 13.5, pitch: 0 },
       };
 
       const DATASET_EXAMPLES = {
         buildings: [
           "高さ100m以上",
-          "高さ50m以上",
-          "高さ20m以下",
-          "クラス=residential",
+          "学校",
+          "ホテル",
+          "病院",
         ],
         places: [
           "カテゴリ=cafe",
           "カテゴリ=restaurant",
           "信頼度0.7以上",
           "名前にスタバ",
+        ],
+        transportation: [
+          "線路",
+          "高速道路",
+          "地下鉄",
+          "歩道",
         ],
       };
 
@@ -215,6 +222,24 @@
             "circle-color": "#22d3ee",
             "circle-stroke-color": "#0e7490",
             "circle-stroke-width": 1,
+          },
+        },
+        transportation: {
+          type: "line",
+          paint: {
+            "line-color": [
+              "match",
+              ["get", "subtype"],
+              "rail", "#f43f5e",
+              "water", "#0ea5e9",
+              /* default (road) */ "#facc15",
+            ],
+            "line-width": [
+              "interpolate", ["linear"], ["zoom"],
+              10, 0.5,
+              16, 4,
+            ],
+            "line-opacity": 0.85,
           },
         },
       };

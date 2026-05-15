@@ -32,3 +32,6 @@ data/
 # Local env
 .env
 .env.local
+
+# Playwright debug artifacts
+.playwright-cli/

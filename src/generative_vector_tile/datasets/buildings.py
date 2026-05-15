@@ -2,9 +2,20 @@ from generative_vector_tile.datasets.base import Column, Dataset
 
 OVERTURE_RELEASE = "2026-04-15.0"
 
-# Overture Buildings v1.x `class` enum. Reference:
-# https://docs.overturemaps.org/schema/reference/buildings/building/
-BUILDINGS_CLASS_ENUM = (
+# Overture buildings schema (release 2026-04-15.0) actually puts the broad
+# rollup in `subtype` and the fine-grained value in `class`, opposite to
+# what the column names suggest. Verified empirically against the Tokyo
+# bbox: `class` contained values like 'school', 'hotel', 'stadium',
+# 'temple', 'apartments' while `subtype` contained 'residential',
+# 'commercial', 'education', 'religious'. We list the enums to match
+# reality so the LLM emits values that actually exist in the data.
+#
+# Note: only ~4% of Tokyo buildings have non-null class / subtype. Even
+# correctly-targeted filters will return very few hits in most areas; the
+# rest of the data is unclassified.
+
+# Broad rollup. ~14 values.
+BUILDINGS_SUBTYPE_ENUM = (
     "agricultural",
     "civic",
     "commercial",
@@ -20,11 +31,8 @@ BUILDINGS_CLASS_ENUM = (
     "transportation",
 )
 
-# Overture Buildings `subtype` enum (~50 specific values rolling up to `class`).
-# This is the column to filter on for fine-grained categories like stadium,
-# school, hospital, temple, hotel -- exposing it gives the LLM something real
-# to map natural-language queries to instead of guessing class values.
-BUILDINGS_SUBTYPE_ENUM = (
+# Fine-grained category. ~50 values, rolls up to subtype.
+BUILDINGS_CLASS_ENUM = (
     # agricultural
     "agricultural", "barn", "farm_auxiliary", "greenhouse", "silo", "stable",
     # civic
@@ -56,6 +64,8 @@ BUILDINGS_SUBTYPE_ENUM = (
     "service",
     # transportation
     "transportation", "train_station", "parking", "hangar",
+    # observed in Tokyo data but not in upstream schema docs
+    "roof", "public",
 )
 
 buildings = Dataset(
@@ -99,14 +109,19 @@ buildings = Dataset(
         "サブタイプ": "subtype",
         "名前": "name",
         "名称": "name",
-        # The user almost always cares about subtype-level granularity when
-        # naming a building type in Japanese ("学校", "病院" etc.), so map
-        # those to subtype rather than the coarser class.
-        "学校": "subtype",
-        "病院": "subtype",
-        "競技場": "subtype",
-        "ホテル": "subtype",
-        "寺": "subtype",
-        "教会": "subtype",
+        # Granular building types are stored in `class` (post-schema-fix).
+        "学校": "class",
+        "病院": "class",
+        "競技場": "class",
+        "ホテル": "class",
+        "寺": "class",
+        "教会": "class",
+        "工場": "class",
+        "倉庫": "class",
+        "アパート": "class",
+        # Broad categories live in `subtype`.
+        "教育施設": "subtype",
+        "商業施設": "subtype",
+        "居住施設": "subtype",
     },
 )

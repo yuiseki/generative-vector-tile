@@ -44,22 +44,6 @@ def get_connection() -> duckdb.DuckDBPyConnection:
         # in us-west-2.
         con.execute("SET s3_region='us-west-2';")
 
-        # Lean on every layer of DuckDB's built-in caching:
-        # - enable_external_file_cache: chunk-level in-memory cache for
-        #   httpfs reads (default on in 1.5.x). Adjacent tiles reading
-        #   overlapping row groups in the same parquet file hit RAM.
-        # - parquet_metadata_cache: caches parquet footer + row group stats
-        #   so re-querying the same file skips the metadata refetch.
-        # - enable_http_metadata_cache: caches HEAD responses so re-reading
-        #   the same URL skips a network round-trip.
-        # - validate_external_file_cache=NO_VALIDATION: Overture releases
-        #   are immutable, so the cache never needs revalidation. With the
-        #   default VALIDATE_ALL we'd re-HEAD remote files on every lookup.
-        con.execute("SET enable_external_file_cache=true;")
-        con.execute("SET parquet_metadata_cache=true;")
-        con.execute("SET enable_http_metadata_cache=true;")
-        con.execute("SET validate_external_file_cache='NO_VALIDATION';")
-
         # Resource caps default to DuckDB's own (memory ~80% of system RAM,
         # threads = num_cores). Earlier hard-coded values of memory_limit=1GB
         # / threads=4 were defensive for a Knative pod with 2Gi limit but

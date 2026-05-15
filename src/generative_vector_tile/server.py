@@ -13,13 +13,14 @@ Run: `uv run python -m generative_vector_tile.server`
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
 
 import duckdb
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from generative_vector_tile.cache import get_default_cache
@@ -95,8 +96,28 @@ def datasets() -> dict:
     }
 
 
+CLIENT_DISCONNECT_STATUS = 499
+DISCONNECT_HEADERS = {"X-Tile-Cache": "abandoned", "X-Tile-Error": "client-disconnected"}
+
+
+def _abandoned_response() -> Response:
+    """Empty MVT used when we detect the client has gone away mid-request.
+
+    Returning a body even with status 499 keeps logging / metrics consistent;
+    the headers tell the (now-gone) client and any intermediary that the work
+    was deliberately abandoned, not silently dropped.
+    """
+    return Response(
+        content=b"",
+        media_type=MVT_MEDIA_TYPE,
+        status_code=CLIENT_DISCONNECT_STATUS,
+        headers=DISCONNECT_HEADERS,
+    )
+
+
 @app.get("/tile/{dataset_id}/{z}/{x}/{y}.mvt")
-def tile(
+async def tile(
+    request: Request,
     dataset_id: str,
     z: int,
     x: int,
@@ -112,8 +133,16 @@ def tile(
     if not (ZOOM_MIN <= z <= ZOOM_MAX):
         raise HTTPException(status_code=400, detail=f"zoom {z} out of range")
 
+    # MapLibre fires bursts of tile requests on every pan; tiles that scroll
+    # out of view get their fetch aborted by the browser. Without this check
+    # the server keeps doing LLM + DuckDB + MVT work for nobody, hogging the
+    # _query_lock that fresh in-viewport tiles need.
+    if await request.is_disconnected():
+        logger.info("tile abandoned-before-compile %s/%d/%d/%d", dataset_id, z, x, y)
+        return _abandoned_response()
+
     try:
-        filter_sql = compile_filter(dataset, q)
+        filter_sql = await asyncio.to_thread(compile_filter, dataset, q)
     except CompileFilterError as e:
         # Distinguish "service not configured" from "translation failed".
         # LlmUnavailable is a config / operations issue and should surface
@@ -154,6 +183,10 @@ def tile(
             headers={"Cache-Control": "public, max-age=300", "X-Tile-Cache": "hit"},
         )
 
+    if await request.is_disconnected():
+        logger.info("tile abandoned-before-compute %s/%d/%d/%d", dataset.id, z, x, y)
+        return _abandoned_response()
+
     def _compute() -> bytes:
         logger.info(
             "tile compute %s/%d/%d/%d q=%r filter_sql=%r",
@@ -165,8 +198,9 @@ def tile(
     # Coalesce concurrent identical misses so 20+ tile fetches for the same
     # (tile, filter) only pay one DuckDB+S3 round-trip.
     try:
-        mvt_bytes = coalescer.get_or_compute(
-            dataset.id, z, x, y, filter_sql, cache, _compute
+        mvt_bytes = await asyncio.to_thread(
+            coalescer.get_or_compute,
+            dataset.id, z, x, y, filter_sql, cache, _compute,
         )
     except duckdb.Error as e:
         # The LLM produced SQL that DuckDB rejects (parse error, unknown
@@ -189,6 +223,12 @@ def tile(
                 "X-Tile-Error": "duckdb-rejected-filter",
             },
         )
+
+    # Final disconnect check: even if we did the work, don't burn TCP write
+    # bandwidth on a client that's already gone.
+    if await request.is_disconnected():
+        logger.info("tile abandoned-after-compute %s/%d/%d/%d", dataset.id, z, x, y)
+        return _abandoned_response()
 
     return Response(
         content=mvt_bytes,

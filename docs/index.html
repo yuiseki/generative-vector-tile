@@ -242,6 +242,18 @@
         ],
       };
 
+      // Per-dataset minzoom: at low zoom each tile covers so much area that
+      // a single DuckDB-over-S3 query takes 15-30s and the lock serializes
+      // every queued tile. Buildings / places lose visual meaning below
+      // z=13 anyway (footprints / dots invisible) so the only thing the user
+      // sees is a hanging spinner. Transportation lines are slightly more
+      // useful at lower zoom but still painfully slow.
+      const MINZOOM_BY_DATASET = {
+        buildings: 14,
+        places: 13,
+        transportation: 12,
+      };
+
       const LAYER_STYLES_BY_DATASET = {
         buildings: {
           type: "fill-extrusion",
@@ -351,7 +363,7 @@
         map.addSource(SOURCE_ID, {
           type: "vector",
           tiles: [url],
-          minzoom: 10,
+          minzoom: MINZOOM_BY_DATASET[currentDataset] ?? 13,
           maxzoom: 16,
         });
         const ds = datasets.find((d) => d.id === currentDataset) || {};

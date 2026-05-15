@@ -70,7 +70,7 @@ BUILDINGS_CLASS_ENUM = (
 
 buildings = Dataset(
     id="buildings",
-    description="Overture Buildings — building footprints with height, class, subtype.",
+    description="Overture Buildings - building footprints with height, class, subtype.",
     overture_release=OVERTURE_RELEASE,
     overture_theme="buildings",
     overture_type="building",
@@ -94,12 +94,11 @@ buildings = Dataset(
             filterable=True,
             enum_values=BUILDINGS_SUBTYPE_ENUM,
         ),
-        Column(
-            name="name",
-            type="string",
-            sql_expr="names.primary",
-            filterable=True,
-        ),
+        # Note: `names.primary` STRUCT access was the dominant tile-fetch
+        # cost (40s+ per tile vs sibling buildings-tile's sub-second). At
+        # z=13-15 building names aren't rendered anyway, so we just don't
+        # project the column. Add it back when a use case actually needs it,
+        # ideally with a dedicated projection toggle.
     ),
     filter_aliases={
         "高さ": "height",

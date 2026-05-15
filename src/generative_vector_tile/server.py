@@ -123,7 +123,7 @@ async def tile(
     x: int,
     y: int,
     q: str | None = Query(default=None, max_length=256),
-    limit: int = Query(default=5000, ge=1, le=LIMIT_MAX),
+    limit: int = Query(default=1000, ge=1, le=LIMIT_MAX),
 ) -> Response:
     try:
         dataset = get_dataset(dataset_id)

@@ -31,7 +31,7 @@ TRANSPORTATION_CLASS_ENUM = (
 
 transportation = Dataset(
     id="transportation",
-    description="Overture Transportation segments — roads, rail, and water lines.",
+    description="Overture Transportation segments - roads, rail, and water lines.",
     overture_release=OVERTURE_RELEASE,
     overture_theme="transportation",
     overture_type="segment",

@@ -163,7 +163,7 @@
         <dt>server</dt>
         <dd><code id="server-url"></code></dd>
         <dt>dataset</dt>
-        <dd><code id="current-dataset">—</code></dd>
+        <dd><code id="current-dataset">-</code></dd>
         <dt>q</dt>
         <dd><code id="current-q">(none)</code></dd>
         <dt>tile url</dt>
@@ -404,7 +404,7 @@
         for (const d of datasets) {
           const opt = document.createElement("option");
           opt.value = d.id;
-          opt.textContent = `${d.id} — ${d.description}`;
+          opt.textContent = `${d.id} - ${d.description}`;
           sel.appendChild(opt);
         }
         sel.addEventListener("change", (e) => {

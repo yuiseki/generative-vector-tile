@@ -130,8 +130,8 @@ The launch script defaults to `LLAMA_CPP_DIR=$HOME/llama.cpp` and the model at t
 
 The `docs/` directory is self-contained:
 
-- `docs/index.html` — MapLibre GL JS UI with dataset selector and `q` input
-- `docs/style.json` — Esri World Imagery raster base style
+- `docs/index.html` - MapLibre GL JS UI with dataset selector and `q` input
+- `docs/style.json` - Esri World Imagery raster base style
 - both are vanilla, no build step
 
 To enable GitHub Pages: repository **Settings → Pages** → Source `Deploy from a branch`, Branch `main` / Folder `/docs`. The viewer then publishes to `https://<owner>.github.io/generative-vector-tile/`.

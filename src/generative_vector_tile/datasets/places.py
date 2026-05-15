@@ -4,7 +4,7 @@ OVERTURE_RELEASE = "2026-04-15.0"
 
 places = Dataset(
     id="places",
-    description="Overture Places — POIs with category, name, confidence.",
+    description="Overture Places - POIs with category, name, confidence.",
     overture_release=OVERTURE_RELEASE,
     overture_theme="places",
     overture_type="place",

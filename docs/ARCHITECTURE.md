@@ -33,8 +33,8 @@ GET /tile/{dataset}/{z}/{x}/{y}.mvt?q=<nl>
 
 The two security boundaries are:
 
-1. **`Dataset.filterable_columns`** — only listed columns can be referenced in `q`. Adding a filterable column is an explicit code change reviewable in PR.
-2. **`parse_filter` output is parameterised** — the SQL fragment uses `?` placeholders and bound `params`. No user-supplied value is interpolated into the SQL string.
+1. **`Dataset.filterable_columns`** - only listed columns can be referenced in `q`. Adding a filterable column is an explicit code change reviewable in PR.
+2. **`parse_filter` output is parameterised** - the SQL fragment uses `?` placeholders and bound `params`. No user-supplied value is interpolated into the SQL string.
 
 DuckDB extension loading runs once at boot (`spatial`, `httpfs`). Phase 2 will add `enable_external_access=false` + a URL allowlist enforced by Knative network policy. Until then, the deployment relies on the cluster-level egress to limit damage if the parser is bypassed.
 

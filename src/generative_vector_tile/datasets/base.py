@@ -12,6 +12,11 @@ class Column:
     type: ColumnType
     sql_expr: str
     filterable: bool = False
+    # When the column has a closed enum (e.g. Overture buildings `class`),
+    # list the legal values here. They're injected into the LLM system
+    # prompt so the model emits real values instead of hallucinating
+    # plausible-looking strings that miss the data.
+    enum_values: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

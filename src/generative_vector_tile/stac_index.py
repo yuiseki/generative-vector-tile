@@ -13,9 +13,12 @@ lookups; an actual R-tree adds complexity without measurable gain at this size.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urljoin
 
 import httpx
@@ -24,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 STAC_ROOT = "https://stac.overturemaps.org"
 StacBBox = tuple[float, float, float, float]
+
+
+def _disk_cache_dir() -> Path:
+    base = os.environ.get("STAC_CACHE_DIR")
+    if base:
+        return Path(base)
+    return Path.home() / ".cache" / "generative-vector-tile" / "stac"
 
 
 @dataclass(frozen=True)
@@ -42,9 +52,43 @@ class StacIndex:
         self._items: list[StacItem] | None = None
         self._lock = threading.Lock()
 
+    def _cache_path(self) -> Path:
+        return _disk_cache_dir() / f"{self._release}_{self._theme}_{self._type}.json"
+
+    def _load_from_disk(self) -> list[StacItem] | None:
+        path = self._cache_path()
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+            items = [StacItem(href=r["href"], bbox=tuple(r["bbox"])) for r in raw]
+            logger.info(
+                "STAC disk-cache hit: %d items from %s", len(items), path
+            )
+            return items
+        except Exception as e:
+            logger.warning("STAC disk-cache load failed (%s); refetching", e)
+            return None
+
+    def _save_to_disk(self, items: list[StacItem]) -> None:
+        path = self._cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(
+                [{"href": it.href, "bbox": list(it.bbox)} for it in items], f
+            )
+        tmp.replace(path)
+        logger.info("STAC disk-cache wrote %d items to %s", len(items), path)
+
     def build(self) -> None:
         with self._lock:
             if self._items is not None:
+                return
+            cached = self._load_from_disk()
+            if cached is not None:
+                self._items = cached
                 return
             collection_url = (
                 f"{STAC_ROOT}/{self._release}/{self._theme}/{self._type}/collection.json"
@@ -74,6 +118,10 @@ class StacIndex:
                     items.append(StacItem(href=data_href, bbox=bbox))
             logger.info("STAC built: %d items for %s/%s", len(items), self._theme, self._type)
             self._items = items
+            try:
+                self._save_to_disk(items)
+            except Exception as e:
+                logger.warning("STAC disk-cache save failed (%s); continuing", e)
 
     def files_for_bbox(self, bbox: StacBBox) -> list[str]:
         if self._items is None:

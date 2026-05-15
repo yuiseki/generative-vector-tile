@@ -42,6 +42,12 @@ class FilterCache:
         with self._lock:
             self._cache[key] = sql_fragment
 
+    def invalidate(self, dataset_id: str, q: str) -> None:
+        """Drop a poisoned entry so the next request gets a fresh LLM call."""
+        key = _cache_key(dataset_id, q)
+        with self._lock:
+            self._cache.pop(key, None)
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._cache)

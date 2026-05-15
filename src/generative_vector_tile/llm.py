@@ -14,8 +14,10 @@ caller with a tight timeout.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
+import threading
 from functools import lru_cache
 
 from openai import OpenAI
@@ -26,7 +28,11 @@ from generative_vector_tile.datasets.base import Column, Dataset
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gpt-5.1"
-DEFAULT_TIMEOUT_S = 8.0
+# Aggressive default: a 2-4B local model on Apple Silicon should respond in
+# 1-3s. Anything beyond 6s is almost certainly a model-load stall or a
+# thinking-loop, neither of which gets faster by waiting longer. Override
+# with LLM_TIMEOUT_S for slower backends.
+DEFAULT_TIMEOUT_S = 6.0
 
 
 class LlmUnavailable(RuntimeError):
@@ -56,28 +62,63 @@ class FilterTranslation(BaseModel):
 
 
 @lru_cache(maxsize=1)
-def _client() -> OpenAI:
-    """Build the OpenAI-compatible client once.
+def _clients() -> tuple[OpenAI, ...]:
+    """Build the OpenAI-compatible client pool once.
 
-    OPENAI_BASE_URL points at any OpenAI-compatible server. Two intended
-    deployments:
-      - OpenAI cloud: set OPENAI_API_KEY; OPENAI_BASE_URL unset (SDK default).
-      - llama.cpp llama-server: set OPENAI_BASE_URL=http://host:port/v1
-        and OPENAI_API_KEY to anything (the server ignores it).
+    Three intended deployments:
+      - OpenAI cloud: OPENAI_API_KEY only. OPENAI_BASE_URL / OPENAI_BASE_URLS
+        unset; the SDK uses api.openai.com.
+      - Single OpenAI-compatible server: OPENAI_BASE_URL=http://host:port/v1
+        and OPENAI_API_KEY=anything (server ignores it).
+      - llama-server pool (round-robin across N instances):
+        OPENAI_BASE_URLS=http://host:p1/v1,http://host:p2/v1,...
+
+    OPENAI_BASE_URLS takes precedence over OPENAI_BASE_URL when both set.
     """
-    base_url = os.environ.get("OPENAI_BASE_URL")
     api_key = os.environ.get("OPENAI_API_KEY")
+    urls_csv = os.environ.get("OPENAI_BASE_URLS")
+    single_url = os.environ.get("OPENAI_BASE_URL")
 
-    if not base_url and not api_key:
+    urls: list[str] = []
+    if urls_csv:
+        urls = [u.strip() for u in urls_csv.split(",") if u.strip()]
+    elif single_url:
+        urls = [single_url]
+
+    if not urls and not api_key:
         raise LlmUnavailable(
-            "Neither OPENAI_API_KEY nor OPENAI_BASE_URL is set; "
+            "None of OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_BASE_URLS is set; "
             "q-based filters cannot be translated"
         )
 
-    kwargs: dict = {"api_key": api_key or "dummy"}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return OpenAI(**kwargs)
+    effective_key = api_key or "dummy"
+    if urls:
+        clients = tuple(OpenAI(api_key=effective_key, base_url=u) for u in urls)
+        logger.info("LLM client pool: %d endpoints", len(clients))
+        return clients
+    return (OpenAI(api_key=effective_key),)
+
+
+_rr_counter = itertools.count()
+_rr_lock = threading.Lock()
+
+
+def _next_client() -> OpenAI:
+    """Round-robin pick across the configured client pool."""
+    pool = _clients()
+    if len(pool) == 1:
+        return pool[0]
+    with _rr_lock:
+        i = next(_rr_counter)
+    return pool[i % len(pool)]
+
+
+# Backwards-compatible accessor used by tests; returns the first client.
+def _client() -> OpenAI:
+    return _clients()[0]
+
+
+_client.cache_clear = _clients.cache_clear  # type: ignore[attr-defined]
 
 
 def _model_name() -> str:
@@ -89,7 +130,16 @@ def _timeout_s() -> float:
 
 
 def _format_column(c: Column) -> str:
-    return f"- {c.name} ({c.type}) sql_expr={c.sql_expr}"
+    base = f"- {c.name} ({c.type}) sql_expr={c.sql_expr}"
+    if c.enum_values:
+        # Listing the legal enum values keeps the model from inventing
+        # plausible-but-fictional category strings. The full list goes
+        # inline because Qwen3 / gpt-5.1 attend to it reliably even at
+        # 30-50 items, and the cost is amortised by automatic prompt
+        # caching once the prompt has been seen.
+        joined = ", ".join(c.enum_values)
+        return f"{base}\n  allowed values: {joined}"
+    return base
 
 
 def build_system_prompt(dataset: Dataset) -> str:
@@ -119,6 +169,7 @@ Rules:
 - Output ONLY the boolean expression body. Do NOT include the WHERE keyword, ORDER BY, LIMIT, semicolons, or any prose.
 - Reference columns by their column name as listed above. Do not use aliases in SQL output -- map them yourself.
 - String literals must be single-quoted, e.g. 'commercial'. Inside the literal, escape single quotes by doubling them.
+- The user's filter is often Japanese, but column values are ALWAYS the English enum strings listed under "allowed values". Translate Japanese category names ("学校", "病院", "ホテル", ...) to the corresponding English enum value yourself; never compare a column against a Japanese string literal.
 - Combine predicates with AND / OR / NOT. Use parentheses for grouping where precedence matters.
 - Allowed comparison: = != < > <= >= IN BETWEEN LIKE ILIKE
 - Allowed scalar functions: LOWER, UPPER, ABS, COALESCE
@@ -136,11 +187,18 @@ def translate_q(dataset: Dataset, q: str) -> str:
       LlmTranslationError: LLM timed out, errored, or produced empty output.
     """
     try:
-        client = _client()
+        client = _next_client()
     except LlmUnavailable:
         raise
 
     system_prompt = build_system_prompt(dataset)
+
+    # Ollama-served thinking models (qwen3.5 etc.) burn tokens on a "reasoning"
+    # field before emitting the JSON we asked for. Ollama lets the caller turn
+    # this off via options.think=false on its native API; via the OpenAI-compat
+    # path the same parameter rides along in extra_body. OpenAI cloud silently
+    # ignores unknown body fields, so it's safe to send unconditionally.
+    extra_body: dict = {"options": {"think": False}}
 
     try:
         response = client.chat.completions.parse(
@@ -151,6 +209,7 @@ def translate_q(dataset: Dataset, q: str) -> str:
             ],
             response_format=FilterTranslation,
             timeout=_timeout_s(),
+            extra_body=extra_body,
         )
     except Exception as e:
         logger.warning("LLM call failed for q=%r on %s: %s", q, dataset.id, e)

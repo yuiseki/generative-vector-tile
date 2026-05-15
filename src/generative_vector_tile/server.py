@@ -17,10 +17,12 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import duckdb
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from generative_vector_tile.cache import get_default_cache
 from generative_vector_tile.datasets import get_dataset, list_datasets
 from generative_vector_tile.duckdb_query import get_connection, query_features
 from generative_vector_tile.filters import CompileFilterError, compile_filter
@@ -114,9 +116,27 @@ def tile(
         filter_sql = compile_filter(dataset, q)
     except CompileFilterError as e:
         # Distinguish "service not configured" from "translation failed".
+        # LlmUnavailable is a config / operations issue and should surface
+        # loudly (503) so the operator notices.
         if isinstance(e.__cause__, LlmUnavailable):
             raise HTTPException(status_code=503, detail=str(e)) from e
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        # LlmTranslationError (timeout, refusal, empty output) is per-request.
+        # Don't 500 the browser -- return an empty MVT so MapLibre's tile
+        # loading doesn't hang. The browser sees a successful empty layer
+        # and the user can retry with a different phrasing.
+        logger.warning(
+            "tile LLM error %s/%d/%d/%d q=%r: %s",
+            dataset_id, z, x, y, q, e,
+        )
+        return Response(
+            content=b"",
+            media_type=MVT_MEDIA_TYPE,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Tile-Cache": "error",
+                "X-Tile-Error": "llm-translation-failed",
+            },
+        )
 
     bbox = tile_to_bbox(z, x, y)
     cache = get_default_tile_cache()
@@ -144,9 +164,31 @@ def tile(
 
     # Coalesce concurrent identical misses so 20+ tile fetches for the same
     # (tile, filter) only pay one DuckDB+S3 round-trip.
-    mvt_bytes = coalescer.get_or_compute(
-        dataset.id, z, x, y, filter_sql, cache, _compute
-    )
+    try:
+        mvt_bytes = coalescer.get_or_compute(
+            dataset.id, z, x, y, filter_sql, cache, _compute
+        )
+    except duckdb.Error as e:
+        # The LLM produced SQL that DuckDB rejects (parse error, unknown
+        # function, etc.). Don't 500 the browser -- it'd leave blank tiles
+        # forever. Instead: drop the bad filter from the cache so the next
+        # request gets a fresh LLM call, and return an empty MVT so MapLibre
+        # finishes loading the tile gracefully.
+        logger.warning(
+            "tile DuckDB error %s/%d/%d/%d q=%r filter_sql=%r: %s",
+            dataset.id, z, x, y, q, filter_sql, e,
+        )
+        if q:
+            get_default_cache().invalidate(dataset.id, q.strip())
+        return Response(
+            content=b"",
+            media_type=MVT_MEDIA_TYPE,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Tile-Cache": "error",
+                "X-Tile-Error": "duckdb-rejected-filter",
+            },
+        )
 
     return Response(
         content=mvt_bytes,

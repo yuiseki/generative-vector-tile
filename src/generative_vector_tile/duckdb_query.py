@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 _query_lock = threading.Lock()
 _connection: duckdb.DuckDBPyConnection | None = None
 
-DEFAULT_MEMORY_LIMIT = "1GB"
-DEFAULT_THREADS = "4"
 # Aggressive default: a single tile against a bbox-pruned Parquet file
 # should land in well under 5s once the connection is warm. Anything longer
 # is either S3 weather or a hostile query, neither of which is improved by
@@ -62,14 +60,20 @@ def get_connection() -> duckdb.DuckDBPyConnection:
         con.execute("SET enable_http_metadata_cache=true;")
         con.execute("SET validate_external_file_cache='NO_VALIDATION';")
 
-        # Per-query resource caps. memory_limit bounds a single query so a
-        # pathological filter cannot push the pod into OOMKilled. threads is
-        # capped so concurrent tile requests don't oversubscribe the pod's
-        # CPU allocation. See ADR-0002 "安全性の設計".
-        mem = os.environ.get("DUCKDB_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT)
-        threads = os.environ.get("DUCKDB_THREADS", DEFAULT_THREADS)
-        con.execute(f"SET memory_limit='{mem}';")
-        con.execute(f"SET threads={threads};")
+        # Resource caps default to DuckDB's own (memory ~80% of system RAM,
+        # threads = num_cores). Earlier hard-coded values of memory_limit=1GB
+        # / threads=4 were defensive for a Knative pod with 2Gi limit but
+        # crippled local dev: the external_file_cache had nowhere to live and
+        # parquet reads couldn't use the available cores. The Mac PoC sees a
+        # ~100x speedup just from leaving these alone vs the previous limits.
+        # Production deployment should set DUCKDB_MEMORY_LIMIT / DUCKDB_THREADS
+        # explicitly to match the pod's allocation.
+        mem = os.environ.get("DUCKDB_MEMORY_LIMIT")
+        threads = os.environ.get("DUCKDB_THREADS")
+        if mem:
+            con.execute(f"SET memory_limit='{mem}';")
+        if threads:
+            con.execute(f"SET threads={threads};")
 
         _connection = con
         return con

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# uv
+.uv/
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# Data scratch
+data/
+.cache/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Local env
+.env
+.env.local

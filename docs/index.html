@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>generative-vector-tile viewer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: light;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: system-ui, -apple-system, sans-serif;
+      }
+      #map {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 100%;
+      }
+      .panel {
+        position: absolute;
+        z-index: 1;
+        background: rgba(255, 255, 255, 0.92);
+        padding: 10px 14px;
+        border-radius: 6px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+        font-size: 13px;
+        max-width: 360px;
+      }
+      #info {
+        top: 10px;
+        left: 10px;
+      }
+      #info h1 {
+        margin: 0 0 6px 0;
+        font-size: 15px;
+      }
+      #info dl {
+        margin: 0;
+        display: grid;
+        grid-template-columns: max-content 1fr;
+        gap: 2px 8px;
+        font-size: 12px;
+      }
+      #info dt {
+        color: #666;
+      }
+      #info dd {
+        margin: 0;
+        word-break: break-word;
+      }
+      #controls {
+        bottom: 20px;
+        left: 10px;
+      }
+      #controls label {
+        display: block;
+        margin: 4px 0;
+      }
+      #controls select,
+      #controls input[type="text"] {
+        width: 240px;
+        padding: 4px 6px;
+        font-size: 13px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+      }
+      #controls button {
+        padding: 4px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        border: 1px solid #888;
+        background: #f5f5f5;
+        border-radius: 4px;
+      }
+      .examples {
+        margin-top: 4px;
+        font-size: 11px;
+        color: #555;
+      }
+      .examples a {
+        cursor: pointer;
+        color: #2563eb;
+        margin-right: 8px;
+      }
+      .examples a:hover {
+        text-decoration: underline;
+      }
+      #status {
+        top: 10px;
+        right: 10px;
+        font-size: 12px;
+      }
+      .status-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 2px 0;
+      }
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #aaa;
+      }
+      .status-dot.ok {
+        background: #22c55e;
+      }
+      .status-dot.fail {
+        background: #ef4444;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+
+    <div id="info" class="panel">
+      <h1>generative-vector-tile</h1>
+      <dl>
+        <dt>server</dt>
+        <dd><code id="server-url"></code></dd>
+        <dt>dataset</dt>
+        <dd><code id="current-dataset">—</code></dd>
+        <dt>q</dt>
+        <dd><code id="current-q">(none)</code></dd>
+        <dt>tile url</dt>
+        <dd><code id="current-tile-url" style="font-size: 11px"></code></dd>
+      </dl>
+    </div>
+
+    <div id="status" class="panel">
+      <div class="status-row">
+        <div id="server-dot" class="status-dot"></div>
+        <span>server</span>
+      </div>
+      <div class="status-row">
+        <div id="tile-dot" class="status-dot"></div>
+        <span>last tile</span>
+      </div>
+    </div>
+
+    <div id="controls" class="panel">
+      <label>
+        dataset
+        <select id="dataset"></select>
+      </label>
+      <label>
+        q (natural language filter)
+        <input
+          type="text"
+          id="q"
+          placeholder="e.g. 高さ100m以上"
+          autocomplete="off"
+        />
+      </label>
+      <div>
+        <button id="apply">apply</button>
+        <button id="clear">clear</button>
+      </div>
+      <div id="examples" class="examples"></div>
+    </div>
+
+    <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const tileServer = (
+        params.get("server") || "https://generative-vector-tile.yuiseki.com"
+      ).replace(/\/+$/, "");
+      const initialDatasetId = params.get("dataset") || "buildings";
+      const initialQ = params.get("q") || "";
+
+      // Preset views chosen so the default zoom shows something interesting
+      // for each dataset: Manhattan for buildings (skyline), Tokyo for places
+      // (dense POI). City presets are overridable via ?lng=&lat=&zoom=.
+      const PRESET_VIEWS = {
+        buildings: { center: [-73.985, 40.758], zoom: 15.5, pitch: 50 },
+        places: { center: [139.7625, 35.681], zoom: 15, pitch: 0 },
+      };
+
+      const DATASET_EXAMPLES = {
+        buildings: [
+          "高さ100m以上",
+          "高さ50m以上",
+          "高さ20m以下",
+          "クラス=residential",
+        ],
+        places: [
+          "カテゴリ=cafe",
+          "カテゴリ=restaurant",
+          "信頼度0.7以上",
+          "名前にスタバ",
+        ],
+      };
+
+      const LAYER_STYLES_BY_DATASET = {
+        buildings: {
+          type: "fill-extrusion",
+          paint: {
+            "fill-extrusion-color": "#fbbf24",
+            "fill-extrusion-height": ["coalesce", ["get", "height"], 3],
+            "fill-extrusion-base": 0,
+            "fill-extrusion-opacity": 0.75,
+          },
+        },
+        places: {
+          type: "circle",
+          paint: {
+            "circle-radius": 5,
+            "circle-color": "#22d3ee",
+            "circle-stroke-color": "#0e7490",
+            "circle-stroke-width": 1,
+          },
+        },
+      };
+
+      const SOURCE_ID = "gvt";
+      const LAYER_ID = "gvt-layer";
+
+      document.getElementById("server-url").textContent = tileServer;
+
+      let currentDataset = initialDatasetId;
+      let currentQ = initialQ;
+      // Seed the dataset list synchronously so the form is populated before
+      // any async work. /datasets fetch may refresh / extend this later.
+      let datasets = [
+        { id: "buildings", description: "Overture Buildings", mvt_layer_name: "buildings" },
+        { id: "places", description: "Overture Places", mvt_layer_name: "places" },
+      ];
+
+      const map = new maplibregl.Map({
+        container: "map",
+        style: "./style.json",
+        center: PRESET_VIEWS[currentDataset]?.center || [139.7625, 35.681],
+        zoom: PRESET_VIEWS[currentDataset]?.zoom || 14,
+        pitch: PRESET_VIEWS[currentDataset]?.pitch || 0,
+        bearing: 0,
+        hash: true,
+      });
+      map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
+      map.addControl(new maplibregl.ScaleControl(), "bottom-left");
+
+      function buildTilesUrl(datasetId, q) {
+        const qs = q && q.trim() ? `?q=${encodeURIComponent(q.trim())}` : "";
+        return `${tileServer}/tile/${datasetId}/{z}/{x}/{y}.mvt${qs}`;
+      }
+
+      function setStatusDot(id, state) {
+        const el = document.getElementById(id);
+        el.classList.remove("ok", "fail");
+        if (state === "ok") el.classList.add("ok");
+        if (state === "fail") el.classList.add("fail");
+      }
+
+      function refreshInfo() {
+        document.getElementById("current-dataset").textContent = currentDataset;
+        document.getElementById("current-q").textContent = currentQ || "(none)";
+        document.getElementById("current-tile-url").textContent = buildTilesUrl(
+          currentDataset,
+          currentQ,
+        );
+      }
+
+      function updateUrlBar() {
+        const url = new URL(window.location.href);
+        url.searchParams.set("dataset", currentDataset);
+        if (currentQ) {
+          url.searchParams.set("q", currentQ);
+        } else {
+          url.searchParams.delete("q");
+        }
+        window.history.replaceState({}, "", url.toString());
+      }
+
+      function applyLayer() {
+        const url = buildTilesUrl(currentDataset, currentQ);
+        if (map.getLayer(LAYER_ID)) map.removeLayer(LAYER_ID);
+        if (map.getSource(SOURCE_ID)) map.removeSource(SOURCE_ID);
+        map.addSource(SOURCE_ID, {
+          type: "vector",
+          tiles: [url],
+          minzoom: 10,
+          maxzoom: 16,
+        });
+        const ds = datasets.find((d) => d.id === currentDataset) || {};
+        const layerName = ds.mvt_layer_name || currentDataset;
+        const style = LAYER_STYLES_BY_DATASET[currentDataset] || {
+          type: "circle",
+          paint: { "circle-radius": 4, "circle-color": "#ef4444" },
+        };
+        map.addLayer({
+          id: LAYER_ID,
+          source: SOURCE_ID,
+          "source-layer": layerName,
+          ...style,
+        });
+        refreshInfo();
+        updateUrlBar();
+      }
+
+      function populateExamples() {
+        const root = document.getElementById("examples");
+        root.innerHTML = "";
+        const examples = DATASET_EXAMPLES[currentDataset] || [];
+        for (const ex of examples) {
+          const a = document.createElement("a");
+          a.textContent = ex;
+          a.addEventListener("click", () => {
+            document.getElementById("q").value = ex;
+            currentQ = ex;
+            applyLayer();
+          });
+          root.appendChild(a);
+        }
+      }
+
+      function populateDatasetSelector() {
+        const sel = document.getElementById("dataset");
+        sel.innerHTML = "";
+        for (const d of datasets) {
+          const opt = document.createElement("option");
+          opt.value = d.id;
+          opt.textContent = `${d.id} — ${d.description}`;
+          sel.appendChild(opt);
+        }
+        sel.addEventListener("change", (e) => {
+          currentDataset = e.target.value;
+          populateExamples();
+          const view = PRESET_VIEWS[currentDataset];
+          if (view) {
+            map.flyTo({
+              center: view.center,
+              zoom: view.zoom,
+              pitch: view.pitch,
+            });
+          }
+          applyLayer();
+        });
+      }
+
+      // Single source of truth: copy currentDataset / currentQ into the DOM.
+      // Called after the dataset list is loaded so the select element actually
+      // has the option to point at, and again after any programmatic state
+      // change that should be visible in the form.
+      function syncFormFromState() {
+        const sel = document.getElementById("dataset");
+        if (datasets.some((d) => d.id === currentDataset)) {
+          sel.value = currentDataset;
+        } else if (datasets.length > 0) {
+          // URL pointed at an unknown dataset; fall back to the first known one.
+          currentDataset = datasets[0].id;
+          sel.value = currentDataset;
+        }
+        const qInput = document.getElementById("q");
+        qInput.value = currentQ;
+      }
+
+      function wireControls() {
+        const qInput = document.getElementById("q");
+        document.getElementById("apply").addEventListener("click", () => {
+          currentQ = qInput.value;
+          applyLayer();
+        });
+        document.getElementById("clear").addEventListener("click", () => {
+          qInput.value = "";
+          currentQ = "";
+          applyLayer();
+        });
+        qInput.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            currentQ = qInput.value;
+            applyLayer();
+          }
+        });
+      }
+
+      function wireTileStatus() {
+        map.on("sourcedata", (e) => {
+          if (e.sourceId === SOURCE_ID && e.isSourceLoaded) {
+            setStatusDot("tile-dot", "ok");
+          }
+        });
+        map.on("error", (e) => {
+          if (e?.error?.message?.includes("status")) {
+            setStatusDot("tile-dot", "fail");
+          }
+        });
+      }
+
+      function wireClickPopup() {
+        const popup = new maplibregl.Popup({ closeButton: true });
+        map.on("click", (e) => {
+          const features = map.queryRenderedFeatures(e.point, {
+            layers: [LAYER_ID],
+          });
+          if (features.length === 0) return;
+          const f = features[0];
+          const rows = Object.entries(f.properties)
+            .map(([k, v]) => `<dt><b>${k}</b></dt><dd>${v}</dd>`)
+            .join("");
+          popup
+            .setLngLat(e.lngLat)
+            .setHTML(
+              `<div style="font-size:12px"><dl style="margin:4px 0 0 0">${rows}</dl></div>`,
+            )
+            .addTo(map);
+        });
+        map.on("mouseenter", LAYER_ID, () => (map.getCanvas().style.cursor = "pointer"));
+        map.on("mouseleave", LAYER_ID, () => (map.getCanvas().style.cursor = ""));
+      }
+
+      // Refresh `datasets` from the server. Doesn't touch the form or the
+      // map -- callers are responsible for re-rendering once this resolves.
+      async function refreshDatasetsFromServer() {
+        try {
+          const res = await fetch(`${tileServer}/datasets`);
+          if (!res.ok) throw new Error(`status ${res.status}`);
+          const j = await res.json();
+          if (Array.isArray(j.datasets) && j.datasets.length > 0) {
+            datasets = j.datasets;
+          }
+          setStatusDot("server-dot", "ok");
+        } catch (err) {
+          console.warn("dataset fetch failed:", err);
+          setStatusDot("server-dot", "fail");
+          // Keep the seed datasets we declared at script-load time.
+        }
+      }
+
+      // Step 1: form population. URL params → state → DOM. No async, no map
+      // dependency. This is the user's complaint of last resort: the URL has
+      // ?dataset=...&q=... so the form must show those values immediately,
+      // regardless of whether the map style loaded or the server is reachable.
+      populateDatasetSelector();
+      populateExamples();
+      wireControls();
+      syncFormFromState();
+      refreshInfo();
+
+      // Step 2: once the map is ready, wire the tile layer. Probe map state
+      // because the load event fires once and may fire before this listener
+      // is attached for fast local styles.
+      function whenMapReady(cb) {
+        if (map.loaded() && map.isStyleLoaded()) {
+          cb();
+        } else {
+          map.once("load", cb);
+        }
+      }
+      whenMapReady(() => {
+        wireTileStatus();
+        wireClickPopup();
+        applyLayer();
+      });
+
+      // Step 3: server dataset refresh runs in parallel. If it brings new or
+      // different datasets, re-render the selector while preserving the
+      // user's current choice from the URL.
+      refreshDatasetsFromServer().then(() => {
+        populateDatasetSelector();
+        populateExamples();
+        syncFormFromState();
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,42 @@
+[project]
+name = "generative-vector-tile"
+version = "0.1.0"
+description = "Generative dynamic vector tile FaaS: natural-language filter parameters over Overture GeoParquet via DuckDB Spatial."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "mercantile>=1.2",
+    "mapbox-vector-tile>=2.0",
+    "shapely>=2.0",
+    "httpx>=0.27",
+    "openai>=1.50",
+    "pydantic>=2",
+    "cachetools>=5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/generative_vector_tile"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

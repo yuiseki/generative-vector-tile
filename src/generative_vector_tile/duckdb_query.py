@@ -105,11 +105,19 @@ def query_features(
     read-only, and SSRF is blocked at the network layer, so the absence of
     a parser-level allowlist is acceptable. DuckDB's own parser fails closed
     on syntactically invalid expressions, which the caller surfaces as 400.
+
+    Two source modes:
+    - Overture (default): STAC bbox index → filtered S3 URLs → bbox struct WHERE
+    - Direct URL (dataset.parquet_urls set): fixed URLs → ST_Intersects WHERE
     """
-    index = get_stac_index(
-        dataset.overture_release, dataset.overture_theme, dataset.overture_type
-    )
-    files = index.files_for_bbox(bbox)
+    if dataset.parquet_urls is not None:
+        files = list(dataset.parquet_urls)
+    else:
+        index = get_stac_index(
+            dataset.overture_release, dataset.overture_theme, dataset.overture_type
+        )
+        files = index.files_for_bbox(bbox)
+
     if not files:
         return []
 
@@ -120,19 +128,28 @@ def query_features(
     files_literal = ", ".join(f"'{f}'" for f in files)
     west, south, east, north = bbox
 
-    # Filter on the GeoParquet `bbox` struct rather than ST_Intersects(geom,
-    # envelope). The bbox columns are native parquet stats that DuckDB pushes
-    # down for row-group pruning -- the actual S3 byte fetch becomes
-    # proportional to features in the tile, not file size.
-    sql_parts = [
-        f"SELECT {select_columns}, ST_AsWKB({geom_expr}) AS __wkb",
-        f"FROM read_parquet([{files_literal}])",
-        "WHERE bbox.xmin <= ?",
-        "  AND bbox.xmax >= ?",
-        "  AND bbox.ymin <= ?",
-        "  AND bbox.ymax >= ?",
-    ]
-    params: list[object] = [east, west, north, south]
+    if dataset.use_st_intersects:
+        # Direct-URL datasets (e.g. Natural Earth) lack the GeoParquet bbox
+        # struct. Use ST_Intersects with a tile envelope instead.
+        sql_parts = [
+            f"SELECT {select_columns}, ST_AsWKB({geom_expr}) AS __wkb",
+            f"FROM read_parquet([{files_literal}])",
+            f"WHERE ST_Intersects({geom_expr}, ST_MakeEnvelope(?, ?, ?, ?))",
+        ]
+        params: list[object] = [west, south, east, north]
+    else:
+        # Overture GeoParquet 1.1 bbox struct: DuckDB pushes the filter down
+        # to row-group level, so only the relevant S3 byte ranges are fetched.
+        sql_parts = [
+            f"SELECT {select_columns}, ST_AsWKB({geom_expr}) AS __wkb",
+            f"FROM read_parquet([{files_literal}])",
+            "WHERE bbox.xmin <= ?",
+            "  AND bbox.xmax >= ?",
+            "  AND bbox.ymin <= ?",
+            "  AND bbox.ymax >= ?",
+        ]
+        params = [east, west, north, south]
+
     if filter_sql:
         sql_parts.append(f"  AND ({filter_sql})")
     sql_parts.append(f"LIMIT {int(limit)}")

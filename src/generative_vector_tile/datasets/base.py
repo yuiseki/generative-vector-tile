@@ -21,22 +21,36 @@ class Column:
 
 @dataclass(frozen=True)
 class Dataset:
-    """Static registration of an Overture-backed source.
+    """Static registration of a GeoParquet-backed source.
 
-    The dataset declares its read_parquet root, output columns (projected into
-    the MVT), and which columns are exposed to the `q=` filter pipeline. The
-    filter parser will reject any reference to a column that isn't listed in
-    `filterable_columns`, so this dataclass is the security boundary for
-    column-level access.
+    Two source modes are supported:
+
+    Overture mode (default):
+        Set overture_release / overture_theme / overture_type. The server
+        fetches the Overture STAC catalog at boot, builds a bbox spatial
+        index, and resolves (theme, type, bbox) → S3 Parquet URLs at query
+        time. The WHERE clause uses the GeoParquet 1.1 bbox struct for
+        row-group pruning.
+
+    Direct-URL mode (for non-Overture sources, e.g. Natural Earth):
+        Set parquet_urls to a tuple of HTTPS Parquet file URLs. The STAC
+        lookup is skipped entirely; all listed files are queried for every
+        request. The WHERE clause uses ST_Intersects(geometry_col, envelope)
+        instead of the bbox struct (set use_st_intersects=True).
+        overture_release / overture_theme / overture_type are ignored.
     """
 
     id: str
     description: str
-    overture_release: str
-    overture_theme: str
-    overture_type: str
     columns: tuple[Column, ...]
     mvt_layer_name: str
+    # Overture STAC mode (at least one must be set if parquet_urls is None)
+    overture_release: str = ""
+    overture_theme: str = ""
+    overture_type: str = ""
+    # Direct-URL mode
+    parquet_urls: tuple[str, ...] | None = None
+    use_st_intersects: bool = False
     filter_aliases: dict[str, str] = field(default_factory=dict)
 
     @property

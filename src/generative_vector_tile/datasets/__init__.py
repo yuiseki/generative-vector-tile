@@ -1,5 +1,6 @@
 from generative_vector_tile.datasets.base import Column, Dataset
 from generative_vector_tile.datasets.buildings import buildings
+from generative_vector_tile.datasets.countries import economics, population
 from generative_vector_tile.datasets.places import places
 from generative_vector_tile.datasets.transportation import transportation
 
@@ -7,6 +8,8 @@ REGISTRY: dict[str, Dataset] = {
     places.id: places,
     buildings.id: buildings,
     transportation.id: transportation,
+    population.id: population,
+    economics.id: economics,
 }
 
 

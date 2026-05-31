@@ -51,6 +51,8 @@ async def lifespan(app: FastAPI):
     try:
         get_connection()
         for ds in list_datasets():
+            if ds.parquet_urls is not None:
+                continue  # direct-URL datasets have no STAC index to warm
             get_stac_index(
                 ds.overture_release, ds.overture_theme, ds.overture_type
             ).build()

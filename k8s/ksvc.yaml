@@ -7,16 +7,33 @@ spec:
   template:
     metadata:
       annotations:
-        # Was 0. DuckDB's external file cache is what makes remote Parquet
-        # usable (a z16 divisions tile: 80s cold, 1.5s cached), and scaling
-        # to zero throws that cache away, so every session started with a
-        # user watching a blank map until Cloudflare cut the request at 100s.
-        # One resident pod keeps the cache alive.
+        # This service is not a scale-to-zero workload, and treating it as
+        # one was a mistake in the original design.
+        #
+        # Serving tiles straight out of remote Parquet only works because
+        # DuckDB's external file cache absorbs the row-group reads: one z16
+        # divisions tile costs 80s against a cold cache and 1.5s against a
+        # warm one. That cache lives in the process, so a pod is not
+        # interchangeable with a fresh one -- scaling to zero discards the
+        # single most valuable thing the pod owns, and the next visitor pays
+        # the 80s again. Cloudflare cuts the request off at 100s, so on a bad
+        # day they do not even get the tile.
+        #
+        # Keep one pod resident and let it hold the cache. The idle cost of
+        # one pod is the price of the service working at all on the first
+        # request.
         autoscaling.knative.dev/min-scale: "1"
+        # Cache locality argues for 1 and throughput argues for more; left
+        # at 3 deliberately, since the fast datasets (places, buildings, the
+        # Natural Earth ones) benefit from the parallelism and only divisions
+        # is punished by landing on a cold pod.
         autoscaling.knative.dev/max-scale: "3"
         autoscaling.knative.dev/target: "5"
-        # Longer than the old 60s: a pod that scaled up during a pan burst
-        # has a warm cache worth keeping for the rest of the session.
+        # Same reasoning as min-scale, one level down: a pod that scaled up
+        # during a pan burst has spent real time warming its cache, so give
+        # it 5 minutes of grace instead of the old 60s. Note the flip side --
+        # a scaled-up pod starts cold, so a burst wide enough to spill onto a
+        # second pod still sees slow tiles on that pod (see max-scale).
         autoscaling.knative.dev/scale-down-delay: "300s"
     spec:
       containerConcurrency: 5

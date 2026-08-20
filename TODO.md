@@ -21,24 +21,38 @@ PoC として「Overture GeoParquet を自然言語フィルタで動的ベク�
 
 対応: `docs/index.html` の q input の `input` ハンドラに 300ms 程度の debounce を入れる。Enter / blur では即座に確定。
 
-## 3. DuckDB の HTTP range fetch が連続タイルで再走査される
+## 3. DuckDB の HTTP range fetch が連続タイルで再走査される (解決済み)
 
-現状: pool=4 で並列に DuckDB を回せるようになったが、それでも隣接タイル間で 5-18 秒の cold fetch が発生する。同一 Parquet ファイルの別 row group に毎回 HTTP range request が飛んでいる。`enable_external_file_cache` のデフォルトはファイルメタデータ寄りで、row group 本体のキャッシュが効きにくい。
+**ここに書いてあった結論が間違っていた。** 元の記述はこうだった:
 
-対応案 (どれか / 組み合わせ):
+> `enable_external_file_cache=true` / `parquet_metadata_cache=true` の設定は試したが体感差なし。row group 本体の HTTP range キャッシュは httpfs が持っていないので、上のような上位レイヤでの対応が必要。
 
-- bbox から特定したファイル一覧について、最初のリクエスト直後に背景で `SELECT count(*) FROM read_parquet([files]) WHERE bbox.xmin <= ?...` を投げて row group 本体をキャッシュに乗せる
-- 隣接タイル prefetch を frontend 側で発行する (現在のビューポートの外周 1 周分のタイルを低優先度 fetch)
-- DuckDB ではなく `pyarrow.parquet.ParquetFile` で row group を明示的に読み、`pyarrow.fs.S3FileSystem` のリトライ込みで生バイトを LRU しておく (これは大改造)
+`enable_external_file_cache` は DuckDB 1.5.2 では**デフォルトで有効**で、row group 本体もちゃんとキャッシュする。効果が観測できなかった原因は設定ではなく `duckdb_query` 側の構造だった。当時は `duckdb.connect()` を pool=4 で持っていたが、external file cache は**データベースインスタンス単位**なので、キャッシュも4つに分裂していた。つまりウォームなキャッシュに当たるのは最大4回に1回で、残りは毎回 S3 を読み直していた。「体感差なし」はこれを見ていた。
 
-`enable_external_file_cache=true` / `parquet_metadata_cache=true` の設定は試したが体感差なし。row group 本体の HTTP range キャッシュは httpfs が持っていないので、上のような上位レイヤでの対応が必要。
+1インスタンス + クエリごとに `cursor()` へ変更したところ (cursor はインスタンスのキャッシュを共有する)、z16 の divisions タイルで:
+
+```
+cold        31 rows in 80.6s
+same tile   31 rows in  1.5s
+neighbour   32 rows in  1.5s     ← 隣接タイルも同じ row group を共有
+4-tile concurrent burst: 3.1s wall for all four
+```
+
+上に挙げていた「pyarrow で row group を明示的に読んで自前 LRU」の大改造は不要になった。「最初のリクエスト直後に背景で投げて温める」案も、`WARMUP_TILES` として起動時に実行する形で入っている (Cloudflare が100秒で切るので、cold read はユーザーのリクエスト上で起こしてはいけない)。
+
+教訓: キャッシュ設定を評価するときは、その設定のスコープ (ここではインスタンス単位) と、こちらの接続の持ち方が噛み合っているかを先に確認する。
+
+残っている案:
+
+- 隣接タイル prefetch を frontend 側で発行する (現在のビューポートの外周 1 周分のタイルを低優先度 fetch)。キャッシュが効くようになったので、以前より筋が良くなった
+- `max-scale: 3` のままなので、バーストで2つ目の Pod に載ったタイルは cold キャッシュを引く。キャッシュ局所性を取るなら `max-scale: 1`、スループットを取るなら現状維持
 
 ## 4. Knative デプロイ
 
 ローカル PoC は十分回ったので、`generative-vector-tile.yuiseki.com` で公開する Knative service 化に進む。
 
 - `Dockerfile` (uv + python:3.14-slim)
-- Knative `Service` YAML: cpu=2, memory=4Gi, autoscale=0-3, request-concurrency=4
+- Knative `Service` YAML: cpu=2, memory=4Gi, autoscale=1-3, request-concurrency=5 (`min-scale=0` は不可 — §3 の通りキャッシュを捨ててしまう)
 - Cloudflare Tunnel の DNS と Knative gateway の TLS をどう繋ぐか確認
 
 LLM 側 (llama-server) は GPU 必要なので別 Knative service にし、`OPENAI_BASE_URL` で接続する。`llm.py` の pool は CSV (`OPENAI_BASE_URLS`) で渡せるので Knative で 2 〜 3 replica にしておけば良い。
@@ -47,5 +61,5 @@ LLM 側 (llama-server) は GPU 必要なので別 Knative service にし、`OPEN
 
 - マルチデータセット質問 (例: 「高速道路と高層ビル」) は LLM プロンプトで `dataset` を選ばせる構成が必要。今は 1 タイル = 1 dataset 固定で諦めている
 - フィルタ式の制約強化: 現在は LLM 出力をそのまま DuckDB に通している (ADR-0002 の脅威モデル上は許容範囲)。将来的に外部公開する場合は predicate JSON への移行を検討する
-- `lifespan` の warmup で 1 つだけ実タイルを取得しておけば初回ユーザの体感がさらに良くなる
+- ~~`lifespan` の warmup で 1 つだけ実タイルを取得しておけば初回ユーザの体感がさらに良くなる~~ → `WARMUP_TILES` として実装済み。Ready になる前に実タイルを1枚引く (クラスタ内で167秒、1回だけ)
 - `place` データセットの追加属性 (categories, websites など) を MVT に乗せて popup に出すと PoC として説得力が増す

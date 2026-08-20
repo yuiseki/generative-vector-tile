@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import queue
 import threading
 
 import duckdb
@@ -12,18 +11,29 @@ from generative_vector_tile.stac_index import StacBBox, get_stac_index
 
 logger = logging.getLogger(__name__)
 
+# One DuckDB instance, one cursor per in-flight query.
+#
 # spatial + httpfs SIGSEGV under concurrent queries on the SAME connection
-# (libgeos / libcurl global state). Independent connections are fine: the
-# buildings-tile study rates `duckdb.connect() per thread` as both
-# thread-safe and high throughput. A small fixed pool lets tiles run truly
-# in parallel instead of queuing behind a single _query_lock; this is the
-# difference between "first tile 20s + linear queue growth" and "first
-# tile 20s + 4-way parallel after that" for a 6+ tile pan burst.
-DEFAULT_POOL_SIZE = 4
+# object (libgeos / libcurl global state), so every query still needs its
+# own context -- but a `cursor()` is exactly that, and unlike a separate
+# `duckdb.connect()` it shares the instance's external file cache.
+#
+# That cache is what makes remote Parquet bearable. Measured on one z16
+# divisions tile (3 files, 31 rows): 65.2s cold, then 1.5s and 1.5s. The
+# previous pool of N independent connections meant N independent caches, so
+# at most one request in N saw a warm one and the rest paid the full S3 read
+# again. Cursors are also cheap to throw away, which matters for the
+# watchdog below: killing a cursor leaves the instance (and its warm cache)
+# intact.
+#
+# Concurrency is bounded by a semaphore rather than by the number of
+# connections, preserving the old DUCKDB_POOL_SIZE knob's meaning: how many
+# tiles may hit DuckDB at once.
+DEFAULT_MAX_CONCURRENT_QUERIES = 4
 
 
-def _pool_size() -> int:
-    return max(1, int(os.environ.get("DUCKDB_POOL_SIZE", DEFAULT_POOL_SIZE)))
+def _max_concurrent_queries() -> int:
+    return max(1, int(os.environ.get("DUCKDB_POOL_SIZE", DEFAULT_MAX_CONCURRENT_QUERIES)))
 
 
 # Aggressive default: a single tile against a bbox-pruned Parquet file
@@ -33,12 +43,17 @@ def _pool_size() -> int:
 DEFAULT_QUERY_TIMEOUT_S = 8.0
 
 
+class QueryTimeout(Exception):
+    """The watchdog interrupted the query before it produced rows."""
+
+
 def _query_timeout_s() -> float:
     return float(os.environ.get("DUCKDB_QUERY_TIMEOUT_S", DEFAULT_QUERY_TIMEOUT_S))
 
 
-_pool: queue.Queue[duckdb.DuckDBPyConnection] | None = None
-_pool_lock = threading.Lock()
+_instance: duckdb.DuckDBPyConnection | None = None
+_instance_lock = threading.Lock()
+_query_slots: threading.BoundedSemaphore | None = None
 
 
 def _build_connection() -> duckdb.DuckDBPyConnection:
@@ -62,33 +77,40 @@ def _build_connection() -> duckdb.DuckDBPyConnection:
     return con
 
 
-def _get_pool() -> queue.Queue[duckdb.DuckDBPyConnection]:
-    global _pool
-    if _pool is not None:
-        return _pool
-    with _pool_lock:
-        if _pool is not None:
-            return _pool
-        size = _pool_size()
-        pool: queue.Queue[duckdb.DuckDBPyConnection] = queue.Queue(maxsize=size)
-        for _ in range(size):
-            pool.put(_build_connection())
-        _pool = pool
-        logger.info("duckdb pool initialised: size=%d", size)
-        return pool
+def _get_instance() -> duckdb.DuckDBPyConnection:
+    global _instance, _query_slots
+    if _instance is not None:
+        return _instance
+    with _instance_lock:
+        if _instance is None:
+            slots = _max_concurrent_queries()
+            _query_slots = threading.BoundedSemaphore(slots)
+            _instance = _build_connection()
+            logger.info(
+                "duckdb instance initialised: max_concurrent_queries=%d, "
+                "external_file_cache=%s, memory_limit=%s, threads=%s",
+                slots,
+                _setting(_instance, "enable_external_file_cache"),
+                _setting(_instance, "memory_limit"),
+                _setting(_instance, "threads"),
+            )
+        return _instance
+
+
+def _setting(con: duckdb.DuckDBPyConnection, name: str) -> str:
+    try:
+        return str(con.execute(f"SELECT current_setting('{name}')").fetchone()[0])
+    except duckdb.Error:
+        return "n/a"
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
-    """Return one connection for warmup / one-shot use.
+    """Return the shared instance for warmup / one-shot use.
 
-    Pool is initialised on first call; the returned connection is one of
-    the pool members. Callers must not run concurrent queries on the
-    returned object -- use `query_features` for that.
+    Callers must not run concurrent queries directly on it -- use
+    `query_features`, which takes a cursor per query.
     """
-    pool = _get_pool()
-    con = pool.get()
-    pool.put(con)
-    return con
+    return _get_instance()
 
 
 def query_features(
@@ -96,6 +118,7 @@ def query_features(
     bbox: StacBBox,
     filter_sql: str | None,
     limit: int,
+    timeout_s: float | None = None,
 ) -> list[dict]:
     """Run the dataset query within bbox, returning row dicts including a __wkb blob.
 
@@ -155,25 +178,53 @@ def query_features(
     sql_parts.append(f"LIMIT {int(limit)}")
     sql = "\n".join(sql_parts)
 
-    pool = _get_pool()
-    con = pool.get()
-    timeout = _query_timeout_s()
-    # Watchdog cancels the in-flight query via DuckDB's interrupt(). Without
-    # this, a pathological filter could hold the connection past Knative's
-    # request timeout and stall the pod.
-    timer = threading.Timer(timeout, con.interrupt)
+    con = _get_instance()
+    assert _query_slots is not None
+    # Startup warmup passes its own, much larger budget: the whole point of
+    # that query is to pay the cold read once, and the per-request cap would
+    # kill it right before it finished populating the cache.
+    timeout = _query_timeout_s() if timeout_s is None else timeout_s
+    _query_slots.acquire()
+    cur = con.cursor()
+    # Watchdog cancels the in-flight query so a pathological filter cannot
+    # hold the connection past Knative's request timeout and stall the pod.
+    #
+    # interrupt() must be called on the object that is running the query --
+    # the cursor. Calling it on the parent connection (which is what this
+    # used to do) either does nothing at all or corrupts the in-flight
+    # parquet read into "TProtocolException: Invalid data"; both were
+    # observed, and neither stopped the query. That is why divisions tiles
+    # ran for 125s and then returned an empty tile labelled as a rejected
+    # filter.
+    fired = threading.Event()
+
+    def _interrupt() -> None:
+        fired.set()
+        cur.interrupt()
+
+    timer = threading.Timer(timeout, _interrupt)
     try:
         timer.start()
-        cur = con.cursor()
         try:
             cur.execute(sql, params)
             rows = cur.fetchall()
             columns = [d[0] for d in cur.description]
+        except duckdb.Error as e:
+            if fired.is_set():
+                raise QueryTimeout(
+                    f"query exceeded {timeout:.1f}s "
+                    f"(dataset={dataset.id}, files={len(files)})"
+                ) from e
+            raise
         finally:
             cur.close()
     finally:
         timer.cancel()
-        pool.put(con)
+        # Only the cursor is discarded. Verified that interrupting one cursor
+        # leaves sibling cursors and the instance untouched, so the warm file
+        # cache survives a timeout instead of being thrown away with the
+        # connection.
+        _query_slots.release()
 
     logger.info(
         "duckdb: dataset=%s files=%d rows=%d filter=%r",

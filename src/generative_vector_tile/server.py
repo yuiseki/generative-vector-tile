@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 import duckdb
@@ -25,7 +26,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from generative_vector_tile.cache import get_default_cache
 from generative_vector_tile.datasets import get_dataset, list_datasets
-from generative_vector_tile.duckdb_query import get_connection, query_features
+from generative_vector_tile.duckdb_query import (
+    QueryTimeout,
+    get_connection,
+    query_features,
+)
 from generative_vector_tile.filters import CompileFilterError, compile_filter
 from generative_vector_tile.llm import LlmUnavailable
 from generative_vector_tile.mvt import encode_mvt, tile_to_bbox
@@ -41,7 +46,40 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 MVT_MEDIA_TYPE = "application/vnd.mapbox-vector-tile"
 ZOOM_MIN = 0
 ZOOM_MAX = 22
+LIMIT_DEFAULT = 1000
 LIMIT_MAX = 50000
+
+
+def _warmup_tiles() -> list[tuple[str, int, int, int]]:
+    """Tiles to pull through DuckDB at startup, from WARMUP_TILES.
+
+    Format: comma-separated `dataset/z/x/y` (e.g. "divisions/11/1818/806").
+
+    This exists for the datasets whose Parquet row groups are expensive to
+    pull over the network: DuckDB's external file cache turns a 65s divisions
+    tile into 1.5s, but only once something has paid for the first read. With
+    scale-to-zero that "something" was always a user, staring at a blank map
+    until Cloudflare gave up at 100s. Paying it during startup instead means
+    the pod is not marked ready until the cache is warm.
+    """
+    raw = os.environ.get("WARMUP_TILES", "").strip()
+    if not raw:
+        return []
+    out: list[tuple[str, int, int, int]] = []
+    for spec in raw.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        parts = spec.split("/")
+        if len(parts) != 4:
+            logger.warning("ignoring malformed WARMUP_TILES entry %r", spec)
+            continue
+        dataset_id, z, x, y = parts
+        try:
+            out.append((dataset_id, int(z), int(x), int(y)))
+        except ValueError:
+            logger.warning("ignoring malformed WARMUP_TILES entry %r", spec)
+    return out
 
 
 @asynccontextmanager
@@ -58,12 +96,32 @@ async def lifespan(app: FastAPI):
             ).build()
     except Exception:
         logger.exception("startup warmup failed")
+
+    warmup_timeout = float(os.environ.get("WARMUP_QUERY_TIMEOUT_S", "240"))
+    for dataset_id, z, x, y in _warmup_tiles():
+        t0 = time.monotonic()
+        try:
+            dataset = get_dataset(dataset_id)
+            bbox = tile_to_bbox(z, x, y)
+            rows = await asyncio.to_thread(
+                query_features, dataset, bbox, None, LIMIT_DEFAULT, warmup_timeout
+            )
+            logger.info(
+                "warmup %s/%d/%d/%d: %d rows in %.1fs",
+                dataset_id, z, x, y, len(rows), time.monotonic() - t0,
+            )
+        except Exception:
+            # A cold cache is a slow pod, not a broken one.
+            logger.exception(
+                "warmup %s/%d/%d/%d failed after %.1fs",
+                dataset_id, z, x, y, time.monotonic() - t0,
+            )
     yield
 
 
 app = FastAPI(
     title="generative-vector-tile",
-    version="0.1.3",
+    version="0.1.5",
     description="Generative dynamic vector tile FaaS: natural-language filter parameters over Overture GeoParquet via DuckDB Spatial.",
     lifespan=lifespan,
 )
@@ -142,7 +200,7 @@ async def tile(
     x: int,
     y: int,
     q: str | None = Query(default=None, max_length=256),
-    limit: int = Query(default=1000, ge=1, le=LIMIT_MAX),
+    limit: int = Query(default=LIMIT_DEFAULT, ge=1, le=LIMIT_MAX),
 ) -> Response:
     try:
         dataset = get_dataset(dataset_id)
@@ -220,6 +278,23 @@ async def tile(
         mvt_bytes = await asyncio.to_thread(
             coalescer.get_or_compute,
             dataset.id, z, x, y, filter_sql, cache, _compute,
+        )
+    except QueryTimeout as e:
+        # The query was too slow, not wrong. Distinguishing this from a bad
+        # filter matters twice over: the cached filter is fine and must not be
+        # thrown away, and "duckdb-rejected-filter" on a timeout sends anyone
+        # debugging this straight down the wrong path.
+        logger.warning(
+            "tile query timeout %s/%d/%d/%d q=%r: %s", dataset.id, z, x, y, q, e,
+        )
+        return Response(
+            content=b"",
+            media_type=MVT_MEDIA_TYPE,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Tile-Cache": "error",
+                "X-Tile-Error": "query-timeout",
+            },
         )
     except duckdb.Error as e:
         # The LLM produced SQL that DuckDB rejects (parse error, unknown

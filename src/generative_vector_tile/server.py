@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="generative-vector-tile",
-    version="0.1.1",
+    version="0.1.2",
     description="Generative dynamic vector tile FaaS: natural-language filter parameters over Overture GeoParquet via DuckDB Spatial.",
     lifespan=lifespan,
 )

@@ -4,13 +4,14 @@ Covers administrative boundaries at all levels globally:
   country (admin_level=0), region/state/province (1), county (2-3),
   locality/city, neighborhood, etc.
 
-Overture release: 2026-05-20.0
+Overture release: resolved to the catalog's latest at runtime.
 Theme: divisions / Type: division_area
 """
 
 from generative_vector_tile.datasets.base import Column, Dataset
+from generative_vector_tile.stac_index import LATEST_RELEASE
 
-OVERTURE_RELEASE = "2026-05-20.0"
+OVERTURE_RELEASE = LATEST_RELEASE
 
 SUBTYPE_ENUM = (
     "country",

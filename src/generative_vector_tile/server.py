@@ -29,7 +29,7 @@ from generative_vector_tile.duckdb_query import get_connection, query_features
 from generative_vector_tile.filters import CompileFilterError, compile_filter
 from generative_vector_tile.llm import LlmUnavailable
 from generative_vector_tile.mvt import encode_mvt, tile_to_bbox
-from generative_vector_tile.stac_index import get_stac_index
+from generative_vector_tile.stac_index import get_stac_index, resolve_release
 from generative_vector_tile.tile_cache import (
     get_default_coalescer,
     get_default_tile_cache,
@@ -81,6 +81,19 @@ def health() -> dict:
     return {"ok": True}
 
 
+def _reported_release(dataset) -> str:
+    """Resolved release id for /datasets, degrading to the raw sentinel.
+
+    Never let catalog trouble turn the dataset listing into a 500 -- the rest
+    of the metadata is still useful when the STAC catalog is unreachable.
+    """
+    try:
+        return resolve_release(dataset.overture_release)
+    except Exception as e:
+        logger.warning("release resolve failed for /datasets (%s)", e)
+        return dataset.overture_release
+
+
 @app.get("/datasets")
 def datasets() -> dict:
     return {
@@ -88,7 +101,7 @@ def datasets() -> dict:
             {
                 "id": d.id,
                 "description": d.description,
-                "overture_release": d.overture_release,
+                "overture_release": _reported_release(d),
                 "overture_theme": d.overture_theme,
                 "overture_type": d.overture_type,
                 "filterable_columns": [c.name for c in d.filterable_columns],

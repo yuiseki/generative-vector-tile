@@ -16,10 +16,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -27,6 +28,79 @@ logger = logging.getLogger(__name__)
 
 STAC_ROOT = "https://stac.overturemaps.org"
 StacBBox = tuple[float, float, float, float]
+
+# Datasets register this sentinel instead of a pinned release id. Overture
+# deletes old releases from the STAC catalog after a few months (the pinned
+# 2026-04-15.0 vanished and every tile request started 500ing), so the release
+# is resolved from the catalog's `"latest": true` child link at first use.
+LATEST_RELEASE = "latest"
+
+_RELEASE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.\d+$")
+
+_resolved_latest: str | None = None
+_resolve_lock = threading.Lock()
+
+
+def _release_from_href(href: str) -> str | None:
+    """Extract the release id from a catalog child href.
+
+    Hrefs look like `https://stac.overturemaps.org/2026-08-19.0/catalog.json`
+    (or the relative `./2026-08-19.0/catalog.json`); the release is the last
+    path segment before the filename.
+    """
+    parts = [p for p in urlparse(href).path.split("/") if p and p != "."]
+    for part in reversed(parts):
+        if _RELEASE_RE.match(part):
+            return part
+    return None
+
+
+def _fetch_latest_release() -> str:
+    url = f"{STAC_ROOT}/catalog.json"
+    logger.info("STAC release resolve: %s", url)
+    with httpx.Client(timeout=30.0) as client:
+        catalog = client.get(url).raise_for_status().json()
+    children = [
+        link for link in catalog.get("links", []) if link.get("rel") == "child"
+    ]
+    for link in children:
+        if link.get("latest"):
+            release = _release_from_href(link.get("href", ""))
+            if release:
+                return release
+    # No `latest` flag (or an href we could not parse): fall back to the
+    # highest-sorting release id. The ids are zero-padded dates, so a plain
+    # lexicographic sort is chronological.
+    candidates = sorted(
+        r for r in (_release_from_href(link.get("href", "")) for link in children) if r
+    )
+    if candidates:
+        logger.warning(
+            "STAC catalog has no `latest` child; falling back to %s", candidates[-1]
+        )
+        return candidates[-1]
+    raise RuntimeError(f"no Overture release found in STAC catalog {url}")
+
+
+def resolve_release(release: str) -> str:
+    """Turn the `latest` sentinel into a concrete Overture release id.
+
+    Resolution is cached for the process lifetime so the index and the disk
+    cache stay pinned to one release while a worker is alive. Knative scales
+    these pods to zero, so a fresh pod picks up a new release on its own.
+    Set `OVERTURE_RELEASE` to pin a specific release without a code change.
+    """
+    if release != LATEST_RELEASE:
+        return release
+    override = os.environ.get("OVERTURE_RELEASE")
+    if override and override != LATEST_RELEASE:
+        return override
+    global _resolved_latest
+    with _resolve_lock:
+        if _resolved_latest is None:
+            _resolved_latest = _fetch_latest_release()
+            logger.info("STAC latest release resolved: %s", _resolved_latest)
+        return _resolved_latest
 
 
 def _disk_cache_dir() -> Path:
@@ -142,6 +216,7 @@ _INDEXES_LOCK = threading.Lock()
 
 
 def get_stac_index(release: str, theme: str, type_: str) -> StacIndex:
+    release = resolve_release(release)
     key = (release, theme, type_)
     with _INDEXES_LOCK:
         idx = _INDEXES.get(key)

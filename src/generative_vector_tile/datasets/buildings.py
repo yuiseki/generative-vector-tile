@@ -1,6 +1,7 @@
 from generative_vector_tile.datasets.base import Column, Dataset
+from generative_vector_tile.stac_index import LATEST_RELEASE
 
-OVERTURE_RELEASE = "2026-04-15.0"
+OVERTURE_RELEASE = LATEST_RELEASE
 
 # Overture buildings schema (release 2026-04-15.0) actually puts the broad
 # rollup in `subtype` and the fine-grained value in `class`, opposite to

@@ -1,6 +1,6 @@
 [project]
 name = "generative-vector-tile"
-version = "0.1.0"
+version = "0.1.1"
 description = "Generative dynamic vector tile FaaS: natural-language filter parameters over Overture GeoParquet via DuckDB Spatial."
 readme = "README.md"
 requires-python = ">=3.12"

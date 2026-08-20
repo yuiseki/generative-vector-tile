@@ -15,7 +15,7 @@ spec:
       containerConcurrency: 5
       timeoutSeconds: 300
       containers:
-        - image: generative-vector-tile:0.1.0
+        - image: generative-vector-tile:0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -24,6 +24,20 @@ spec:
               value: "0.0.0.0"
             - name: HOME
               value: /tmp
+            # LLM backend for the `q=` filter compiler. These were set on the
+            # live revision but missing from this manifest, so a plain
+            # `kubectl apply` silently dropped them and every `q=` request
+            # started returning 503 "LLM not configured".
+            - name: OPENAI_BASE_URL
+              value: http://llama-server.knative-pool.svc.cluster.local:8080/v1
+            - name: OPENAI_API_KEY
+              value: dummy
+            - name: OPENAI_MODEL
+              value: gvt-llm
+            - name: LLM_TIMEOUT_S
+              value: "30"
+            - name: DUCKDB_QUERY_TIMEOUT_S
+              value: "30"
           resources:
             requests:
               cpu: "200m"

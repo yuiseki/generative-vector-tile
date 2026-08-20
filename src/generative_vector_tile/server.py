@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="generative-vector-tile",
-    version="0.1.2",
+    version="0.1.3",
     description="Generative dynamic vector tile FaaS: natural-language filter parameters over Overture GeoParquet via DuckDB Spatial.",
     lifespan=lifespan,
 )
@@ -104,6 +104,10 @@ def datasets() -> dict:
                 "overture_release": _reported_release(d),
                 "overture_theme": d.overture_theme,
                 "overture_type": d.overture_type,
+                # The viewer needs this to name the MVT source-layer: it is
+                # not always the dataset id (population and economics both
+                # encode into a "countries" layer).
+                "mvt_layer_name": d.mvt_layer_name,
                 "filterable_columns": [c.name for c in d.filterable_columns],
             }
             for d in list_datasets()

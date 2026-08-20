@@ -219,6 +219,10 @@
         buildings: { center: [-73.985, 40.758], zoom: 15.5, pitch: 50 },
         places: { center: [139.7625, 35.681], zoom: 15, pitch: 0 },
         transportation: { center: [139.7625, 35.681], zoom: 13.5, pitch: 0 },
+        divisions: { center: [139.7625, 35.681], zoom: 11, pitch: 0 },
+        admin1: { center: [138.0, 37.5], zoom: 4.5, pitch: 0 },
+        population: { center: [10, 25], zoom: 1.6, pitch: 0 },
+        economics: { center: [10, 25], zoom: 1.6, pitch: 0 },
       };
 
       const DATASET_EXAMPLES = {
@@ -240,6 +244,30 @@
           "地下鉄",
           "歩道",
         ],
+        divisions: [
+          "区",
+          "admin_level=2",
+          "subtype=locality",
+          "日本の都道府県",
+        ],
+        admin1: [
+          "日本の都道府県",
+          "面積10000平方km以上",
+          "中国の省",
+          "アメリカの州",
+        ],
+        population: [
+          "人口1億人以上",
+          "アジア",
+          "人口ランク上位",
+          "アフリカの国",
+        ],
+        economics: [
+          "GDP1兆ドル以上",
+          "高所得国",
+          "先進国",
+          "ヨーロッパ",
+        ],
       };
 
       // Per-dataset minzoom: at low zoom each tile covers so much area that
@@ -252,6 +280,14 @@
         buildings: 13,
         places: 13,
         transportation: 12,
+        // Overture divisions at z<8 pulls whole-continent geometry per tile
+        // (a cold z8 tile already takes ~110s), so keep the floor high.
+        divisions: 8,
+        // Natural Earth datasets are small enough to serve a whole-world
+        // tile, and they are only meaningful zoomed out.
+        admin1: 0,
+        population: 0,
+        economics: 0,
       };
 
       const LAYER_STYLES_BY_DATASET = {
@@ -291,10 +327,60 @@
             "line-opacity": 0.85,
           },
         },
+        divisions: {
+          type: "fill",
+          paint: {
+            "fill-color": "#a78bfa",
+            "fill-opacity": 0.25,
+            "fill-outline-color": "#7c3aed",
+          },
+        },
+        admin1: {
+          type: "fill",
+          paint: {
+            "fill-color": "#34d399",
+            "fill-opacity": 0.3,
+            "fill-outline-color": "#059669",
+          },
+        },
+        population: {
+          type: "fill",
+          paint: {
+            // Choropleth over Natural Earth pop_est.
+            "fill-color": [
+              "interpolate", ["linear"], ["coalesce", ["get", "pop_est"], 0],
+              0, "#1e3a8a",
+              5000000, "#2563eb",
+              50000000, "#38bdf8",
+              200000000, "#fde047",
+              1000000000, "#f97316",
+            ],
+            "fill-opacity": 0.6,
+            "fill-outline-color": "#0f172a",
+          },
+        },
+        economics: {
+          type: "fill",
+          paint: {
+            "fill-color": [
+              "interpolate", ["linear"], ["coalesce", ["get", "gdp_md"], 0],
+              0, "#134e4a",
+              100000, "#0d9488",
+              1000000, "#5eead4",
+              10000000, "#fbbf24",
+              25000000, "#ef4444",
+            ],
+            "fill-opacity": 0.6,
+            "fill-outline-color": "#0f172a",
+          },
+        },
       };
 
       const SOURCE_ID = "gvt";
       const LAYER_ID = "gvt-layer";
+      // `${dataset}|${source-layer}` of the layer currently on the map, so a
+      // late /datasets response can rebuild it only when it would differ.
+      let appliedLayerKey = null;
 
       document.getElementById("server-url").textContent = tileServer;
 
@@ -306,6 +392,11 @@
         { id: "buildings", description: "Overture Buildings", mvt_layer_name: "buildings" },
         { id: "places", description: "Overture Places", mvt_layer_name: "places" },
       ];
+      // The seed list above is a bootstrap guess, not the truth. Until
+      // /datasets answers we must not "correct" a dataset id that came from
+      // the URL -- ?dataset=divisions used to be silently rewritten to
+      // buildings because divisions is not in the seed list.
+      let datasetsAreAuthoritative = false;
 
       const map = new maplibregl.Map({
         container: "map",
@@ -368,6 +459,7 @@
         });
         const ds = datasets.find((d) => d.id === currentDataset) || {};
         const layerName = ds.mvt_layer_name || currentDataset;
+        appliedLayerKey = `${currentDataset}|${layerName}`;
         const style = LAYER_STYLES_BY_DATASET[currentDataset] || {
           type: "circle",
           paint: { "circle-radius": 4, "circle-color": "#ef4444" },
@@ -401,7 +493,12 @@
       function populateDatasetSelector() {
         const sel = document.getElementById("dataset");
         sel.innerHTML = "";
-        for (const d of datasets) {
+        // Keep an option for a URL-supplied dataset we cannot vouch for yet,
+        // so the select can point at it instead of snapping to another value.
+        const shown = datasets.some((d) => d.id === currentDataset)
+          ? datasets
+          : [...datasets, { id: currentDataset, description: "from URL" }];
+        for (const d of shown) {
           const opt = document.createElement("option");
           opt.value = d.id;
           opt.textContent = `${d.id} - ${d.description}`;
@@ -428,13 +525,19 @@
       // change that should be visible in the form.
       function syncFormFromState() {
         const sel = document.getElementById("dataset");
-        if (datasets.some((d) => d.id === currentDataset)) {
-          sel.value = currentDataset;
-        } else if (datasets.length > 0) {
-          // URL pointed at an unknown dataset; fall back to the first known one.
+        if (
+          !datasets.some((d) => d.id === currentDataset) &&
+          datasetsAreAuthoritative &&
+          datasets.length > 0
+        ) {
+          // The server has spoken and it does not know this dataset; only now
+          // is falling back to a real one better than honouring the URL.
+          console.warn(
+            `unknown dataset "${currentDataset}"; falling back to "${datasets[0].id}"`,
+          );
           currentDataset = datasets[0].id;
-          sel.value = currentDataset;
         }
+        sel.value = currentDataset;
         const qInput = document.getElementById("q");
         qInput.value = currentQ;
       }
@@ -537,6 +640,7 @@
           const j = await res.json();
           if (Array.isArray(j.datasets) && j.datasets.length > 0) {
             datasets = j.datasets;
+            datasetsAreAuthoritative = true;
           }
           setStatusDot("server-dot", "ok");
         } catch (err) {
@@ -579,6 +683,15 @@
         populateDatasetSelector();
         populateExamples();
         syncFormFromState();
+        // The layer may already be on the map, built from the seed list's
+        // guess at the source-layer name (mvt_layer_name is not always the
+        // dataset id -- population and economics both live in "countries").
+        // Rebuild only if the authoritative list changes what we would emit.
+        const ds = datasets.find((d) => d.id === currentDataset) || {};
+        const layerName = ds.mvt_layer_name || currentDataset;
+        if (appliedLayerKey !== null && appliedLayerKey !== `${currentDataset}|${layerName}`) {
+          applyLayer();
+        }
       });
     </script>
   </body>
